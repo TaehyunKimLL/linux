@@ -108,6 +108,7 @@ struct fsg_lun {
 	unsigned int	registered:1;
 	unsigned int	info_valid:1;
 	unsigned int	nofua:1;
+	unsigned int	scsi_passthrough:1;	/* SCSI passthrough mode for /dev/sgXX */
 
 	u32		sense_data;
 	u32		sense_data_info;

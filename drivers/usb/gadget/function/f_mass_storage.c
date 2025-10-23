@@ -195,6 +195,9 @@
 #include <linux/usb/composite.h>
 
 #include <linux/nospec.h>
+#include <scsi/sg.h>
+#include <scsi/scsi_device.h>
+#include <scsi/scsi_cmnd.h>
 
 #include "configfs.h"
 
@@ -600,6 +603,287 @@ static int sleep_thread(struct fsg_common *common, bool can_freeze,
 	return rc ? -EINTR : 0;
 }
 
+
+/*-------------------------------------------------------------------------*/
+
+/*
+ * SCSI Passthrough Helper Functions
+ * For use with /dev/sgXX devices
+ */
+
+static int do_scsi_passthrough_io(struct fsg_lun *curlun, u8 *cdb,
+				  unsigned int cdb_len, void *buffer,
+				  unsigned int buflen, int direction)
+{
+	struct file *filp = curlun->filp;
+	struct inode *inode;
+	int result;
+
+	if (!filp)
+		return -EINVAL;
+
+	inode = file_inode(filp);
+
+	/* Get scsi_device from character device */
+	if (S_ISCHR(inode->i_mode)) {
+		/* For sg devices, we need to find the associated scsi_device */
+		/* The sg driver stores this in its private data structure */
+		/* We'll use a simpler approach - call ioctl through file ops */
+		struct sg_io_hdr io_hdr;
+		unsigned char sense_buffer[SCSI_SENSE_BUFFERSIZE];
+
+		memset(&io_hdr, 0, sizeof(io_hdr));
+		io_hdr.interface_id = 'S';
+		io_hdr.cmd_len = cdb_len;
+		io_hdr.mx_sb_len = sizeof(sense_buffer);
+		io_hdr.dxfer_direction = direction == DATA_DIR_TO_HOST ?
+					 SG_DXFER_FROM_DEV : SG_DXFER_TO_DEV;
+		io_hdr.dxfer_len = buflen;
+		io_hdr.dxferp = buffer;
+		io_hdr.cmdp = cdb;
+		io_hdr.sbp = sense_buffer;
+		io_hdr.timeout = 30000; /* 30 seconds */
+		io_hdr.flags = 0;
+		io_hdr.pack_id = 0;
+		io_hdr.usr_ptr = NULL;
+
+		/* Call the ioctl directly */
+		if (filp->f_op && filp->f_op->unlocked_ioctl) {
+			result = filp->f_op->unlocked_ioctl(filp, SG_IO,
+						(unsigned long)&io_hdr);
+
+			if (result < 0)
+				return result;
+
+			/* Check SCSI status */
+			if (io_hdr.status != 0 || io_hdr.host_status != 0 ||
+			    io_hdr.driver_status != 0) {
+				/* Parse sense data if available */
+				if (io_hdr.sb_len_wr > 0 && sense_buffer[0] != 0) {
+					/* Sense data available - extract sense key */
+					u8 sense_key = sense_buffer[2] & 0x0f;
+					curlun->sense_data = sense_key << 16;
+
+					if (io_hdr.sb_len_wr > 12) {
+						curlun->sense_data |= (sense_buffer[12] << 8);
+						if (io_hdr.sb_len_wr > 13)
+							curlun->sense_data |= sense_buffer[13];
+					}
+				}
+				return -EIO;
+			}
+
+			return io_hdr.resid;
+		}
+	}
+
+	return -EOPNOTSUPP;
+}
+
+static int do_scsi_passthrough_read(struct fsg_common *common)
+{
+	struct fsg_lun		*curlun = common->curlun;
+	struct fsg_buffhd	*bh;
+	int			rc;
+	u32			amount_left;
+	unsigned int		amount;
+	int			resid;
+
+	amount_left = common->data_size_from_cmnd;
+	if (unlikely(amount_left == 0))
+		return -EIO;
+
+	for (;;) {
+		amount = min(amount_left, FSG_BUFLEN);
+
+		/* Wait for the next buffer to become available */
+		bh = common->next_buffhd_to_fill;
+		rc = sleep_thread(common, false, bh);
+		if (rc)
+			return rc;
+
+		if (amount == 0) {
+			bh->inreq->length = 0;
+			bh->state = BUF_STATE_FULL;
+			break;
+		}
+
+		/* Perform SCSI passthrough read */
+		resid = do_scsi_passthrough_io(curlun, common->cmnd,
+					       common->cmnd_size, bh->buf,
+					       amount, DATA_DIR_TO_HOST);
+
+		if (signal_pending(current))
+			return -EINTR;
+
+		if (resid < 0) {
+			LDBG(curlun, "error in SCSI passthrough read: %d\n", resid);
+			curlun->sense_data = SS_UNRECOVERED_READ_ERROR;
+			bh->inreq->length = 0;
+			bh->state = BUF_STATE_FULL;
+			break;
+		}
+
+		amount = amount - resid;
+		amount_left -= amount;
+		common->residue -= amount;
+
+		bh->inreq->length = amount;
+		bh->state = BUF_STATE_FULL;
+
+		if (resid < 0 || amount == 0) {
+			break;
+		}
+
+		if (amount_left == 0)
+			break;
+
+		/* Send this buffer and go read some more */
+		bh->inreq->zero = 0;
+		if (!start_in_transfer(common, bh))
+			return -EIO;
+		common->next_buffhd_to_fill = bh->next;
+	}
+
+	return -EIO;
+}
+
+static int do_scsi_passthrough_write(struct fsg_common *common)
+{
+	struct fsg_lun		*curlun = common->curlun;
+	struct fsg_buffhd	*bh;
+	int			get_some_more;
+	u32			amount_left_to_req, amount_left_to_write;
+	unsigned int		amount;
+	int			resid;
+	int			rc;
+
+	if (curlun->ro) {
+		curlun->sense_data = SS_WRITE_PROTECTED;
+		return -EINVAL;
+	}
+
+	amount_left_to_req = common->data_size_from_cmnd;
+	amount_left_to_write = common->data_size_from_cmnd;
+	get_some_more = 1;
+
+	while (amount_left_to_write > 0) {
+		/* Queue a request for more data from the host */
+		bh = common->next_buffhd_to_fill;
+		if (bh->state == BUF_STATE_EMPTY && get_some_more) {
+			amount = min(amount_left_to_req, FSG_BUFLEN);
+
+			common->usb_amount_left -= amount;
+			amount_left_to_req -= amount;
+			if (amount_left_to_req == 0)
+				get_some_more = 0;
+
+			set_bulk_out_req_length(common, bh, amount);
+			if (!start_out_transfer(common, bh))
+				return -EIO;
+			common->next_buffhd_to_fill = bh->next;
+			continue;
+		}
+
+		/* Write the received data via SCSI passthrough */
+		bh = common->next_buffhd_to_drain;
+		if (bh->state == BUF_STATE_EMPTY && !get_some_more)
+			break;
+
+		rc = sleep_thread(common, false, bh);
+		if (rc)
+			return rc;
+
+		common->next_buffhd_to_drain = bh->next;
+		bh->state = BUF_STATE_EMPTY;
+
+		if (bh->outreq->status != 0) {
+			curlun->sense_data = SS_COMMUNICATION_FAILURE;
+			break;
+		}
+
+		amount = bh->outreq->actual;
+		amount = min(amount, bh->bulk_out_intended_length);
+
+		if (amount == 0)
+			goto empty_write;
+
+		/* Perform SCSI passthrough write */
+		resid = do_scsi_passthrough_io(curlun, common->cmnd,
+					       common->cmnd_size, bh->buf,
+					       amount, DATA_DIR_FROM_HOST);
+
+		if (signal_pending(current))
+			return -EINTR;
+
+		if (resid < 0) {
+			LDBG(curlun, "error in SCSI passthrough write: %d\n", resid);
+			curlun->sense_data = SS_WRITE_ERROR;
+			break;
+		}
+
+		amount = amount - resid;
+		amount_left_to_write -= amount;
+		common->residue -= amount;
+
+		if (resid < 0)
+			break;
+
+empty_write:
+		if (bh->outreq->actual < bh->bulk_out_intended_length) {
+			common->short_packet_received = 1;
+			break;
+		}
+	}
+
+	return -EIO;
+}
+
+/*
+ * Generic SCSI passthrough handler for all commands
+ * Used when scsi_passthrough mode is enabled
+ */
+static int do_scsi_passthrough_command(struct fsg_common *common,
+				       struct fsg_buffhd *bh)
+{
+	struct fsg_lun *curlun = common->curlun;
+	int direction;
+	int resid;
+
+	/* Determine data direction based on common->data_dir */
+	if (common->data_dir == DATA_DIR_TO_HOST) {
+		direction = DATA_DIR_TO_HOST;
+	} else if (common->data_dir == DATA_DIR_FROM_HOST) {
+		direction = DATA_DIR_FROM_HOST;
+	} else {
+		/* No data transfer - just send command */
+		direction = DATA_DIR_NONE;
+	}
+
+	/* For commands with no data transfer */
+	if (common->data_size == 0 || direction == DATA_DIR_NONE) {
+		resid = do_scsi_passthrough_io(curlun, common->cmnd,
+					       common->cmnd_size, NULL,
+					       0, direction);
+		if (resid < 0) {
+			LDBG(curlun, "SCSI passthrough command failed: %d\n", resid);
+			return -EINVAL;
+		}
+		return 0;
+	}
+
+	/* For commands with data transfer to host */
+	if (direction == DATA_DIR_TO_HOST) {
+		return do_scsi_passthrough_read(common);
+	}
+
+	/* For commands with data transfer from host */
+	if (direction == DATA_DIR_FROM_HOST) {
+		return do_scsi_passthrough_write(common);
+	}
+
+	return -EINVAL;
+}
 
 /*-------------------------------------------------------------------------*/
 
@@ -1880,6 +2164,13 @@ static int do_scsi_command(struct fsg_common *common)
 	common->short_packet_received = 0;
 
 	down_read(&common->filesem);	/* We're using the backing file */
+
+	/* Use SCSI passthrough for /dev/sgXX devices */
+	if (common->curlun && common->curlun->scsi_passthrough) {
+		reply = do_scsi_passthrough_command(common, bh);
+		goto out;
+	}
+
 	switch (common->cmnd[0]) {
 
 	case INQUIRY:
@@ -2158,6 +2449,8 @@ unknown_cmnd:
 		}
 		break;
 	}
+
+out:
 	up_read(&common->filesem);
 
 	if (reply == -EINTR || signal_pending(current))

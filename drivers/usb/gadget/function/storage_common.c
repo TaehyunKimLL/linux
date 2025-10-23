@@ -173,6 +173,7 @@ void fsg_lun_close(struct fsg_lun *curlun)
 		fput(curlun->filp);
 		curlun->filp = NULL;
 	}
+	curlun->scsi_passthrough = 0;
 }
 EXPORT_SYMBOL_GPL(fsg_lun_close);
 
@@ -206,6 +207,38 @@ int fsg_lun_open(struct fsg_lun *curlun, const char *filename)
 		ro = 1;
 
 	inode = filp->f_mapping->host;
+
+	/* Check if this is a SCSI generic device (/dev/sgXX) */
+	if (S_ISCHR(inode->i_mode)) {
+		/* Character device - check if it's a SCSI generic device */
+		/* SCSI generic devices typically have major number 21 */
+		unsigned int major = MAJOR(inode->i_rdev);
+
+		if (major == 21 || strncmp(filename, "/dev/sg", 7) == 0) {
+			LINFO(curlun, "enabling SCSI passthrough for: %s\n", filename);
+			curlun->scsi_passthrough = 1;
+
+			/* For SCSI passthrough, we still need to set up basic parameters */
+			/* Use CD-ROM defaults since this is typically used for CD-ROM emulation */
+			if (curlun->cdrom) {
+				blksize = 2048;
+				blkbits = 11;
+			} else {
+				blksize = 512;
+				blkbits = 9;
+			}
+
+			/* Set a reasonable default size - will be overridden by actual device */
+			size = 0x100000000LL; /* 4GB default */
+			num_sectors = size >> blkbits;
+
+			goto skip_size_check;
+		} else {
+			LINFO(curlun, "unsupported character device: %s\n", filename);
+			goto out;
+		}
+	}
+
 	if ((!S_ISREG(inode->i_mode) && !S_ISBLK(inode->i_mode))) {
 		LINFO(curlun, "invalid file type: %s\n", filename);
 		goto out;
@@ -257,6 +290,7 @@ int fsg_lun_open(struct fsg_lun *curlun, const char *filename)
 		goto out;
 	}
 
+skip_size_check:
 	if (fsg_lun_is_open(curlun))
 		fsg_lun_close(curlun);
 
